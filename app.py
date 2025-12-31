@@ -1,17 +1,20 @@
-from flask import Flask, request, redirect, send_from_directory, abort, render_template
 import os
 import logging
+from flask import Flask, request, send_from_directory, abort, render_template
 
-from backend import run_chip
+# Updated imports to match your folder structure
+from backend.backend_timing import run_chip  # Timing dashboard
+from backend.backend_power import run_power  # Power dashboard
 
 app = Flask(__name__)
 
 # --------------------------------------------------
 # Configuration
 # --------------------------------------------------
-CWD_BASE = "/asic_work/ewang/esf/old_work_areas"
-OUTDIR   = "/asic_work/mkhan/website/tempo"
-LOGFILE  = "/asic_work/mkhan/website/logs/timing.log"
+CWD_BASE_TIMING = "/asic_work/ewang/esf/old_work_areas"
+CWD_BASE_POWER  = "/asic_work/jchang/esf/power_released/"
+OUTDIR          = "/asic_work/mkhan/website/tempo"
+LOGFILE         = "/asic_work/mkhan/website/logs/timing.log"
 
 # --------------------------------------------------
 # Logging
@@ -26,55 +29,66 @@ logging.basicConfig(
 # Helpers
 # --------------------------------------------------
 def list_designs(cwd):
-    return sorted([
-        d for d in os.listdir(cwd)
-        if os.path.isdir(os.path.join(cwd, d))
-    ])
+    """List all directories in cwd"""
+    try:
+        return sorted([d for d in os.listdir(cwd) if os.path.isdir(os.path.join(cwd, d))])
+    except Exception:
+        return []
 
 # --------------------------------------------------
 # Index page (multi-select form)
 # --------------------------------------------------
 @app.route("/", methods=["GET", "POST"])
 def index():
-    try:
-        designs = list_designs(CWD_BASE)
-    except Exception:
-        designs = []
+    designs_timing = list_designs(CWD_BASE_TIMING)
+    designs_power  = list_designs(CWD_BASE_POWER)
 
     if request.method == "POST":
         selected_designs = request.form.getlist("designs")
         die = request.form.get("die", "").strip()
+        report_type = request.form.get("mode", "timing")
 
         if not selected_designs or not die:
             abort(400, "Design(s) and Die are required")
 
-        logging.info(f"Running timing dashboard: designs={selected_designs}, die={die}")
+        logging.info(f"Running {report_type} dashboard: designs={selected_designs}, die={die}")
 
-        # Run the backend logic
-        generated = run_chip(
-            cwd=CWD_BASE,
-            die=die,
-            outdir=OUTDIR,
-            designs=selected_designs
-        )
+        if report_type == "timing":
+            generated = run_chip(
+                cwd=CWD_BASE_TIMING,
+                die=die,
+                outdir=OUTDIR,
+                designs=selected_designs
+            )
+        else:  # Power dashboard
+            generated = run_power(
+                cwd=CWD_BASE_POWER,
+                outdir=OUTDIR,
+                designs=selected_designs
+            )
 
         if not generated:
             abort(500, "No dashboard generated")
 
-        # RENDER the template with results instead of just redirecting
-        # This matches the {% if done %} logic in your index.html
         return render_template(
-            "index.html", 
-            designs=designs, 
-            generated=generated, 
+            "index.html",
+            designs_timing=designs_timing,
+            designs_power=designs_power,
+            generated=generated,
             comparison=(len(generated) > 1),
-            done=True
+            done=True,
+            report_type=report_type
         )
 
-    # For GET requests, just show the form
-    return render_template("index.html", designs=designs, done=False)
+    return render_template(
+        "index.html",
+        designs_timing=designs_timing,
+        designs_power=designs_power,
+        done=False
+    )
+
 # --------------------------------------------------
-# Serve generated dashboards (safe)
+# Serve generated dashboards
 # --------------------------------------------------
 @app.route("/files/<path:filename>")
 def files(filename):
@@ -83,7 +97,7 @@ def files(filename):
     return send_from_directory(OUTDIR, filename)
 
 # --------------------------------------------------
-# Main (localhost only)
+# Main
 # --------------------------------------------------
 if __name__ == "__main__":
     app.run(host="127.0.0.1", port=8080)
