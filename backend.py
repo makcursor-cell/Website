@@ -1,603 +1,465 @@
-"""
-Backend parser for *.report.avgpwr files
-Generates formatted HTML power dashboards with regex-based parsing
-"""
+# ----------------------------
+# backend_power.py (regex-parsing, formatted output)
+# ----------------------------
 
-import re
 import os
-from pathlib import Path
-from datetime import datetime
-from typing import Dict, List, Tuple, Optional
-import json
+import re
+import pandas as pd
+import warnings
+import time
 
+warnings.filterwarnings("ignore")
 
-class PowerReportParser:
-    """Regex-based parser for *.report.avgpwr files"""
-    
-    # Regex patterns for parsing power report files
-    PATTERNS = {
-        'header': r'^#\s+Power\s+Report\s*$',
-        'timestamp': r'Timestamp:\s+(.+?)(?:\s|$)',
-        'device_name': r'Device:\s+(.+?)(?:\s|$)',
-        'total_power': r'Total\s+Power:\s+(\d+\.?\d*)\s*(mW|W|µW)',
-        'cpu_power': r'CPU\s+Power:\s+(\d+\.?\d*)\s*(mW|W|µW)',
-        'gpu_power': r'GPU\s+Power:\s+(\d+\.?\d*)\s*(mW|W|µW)',
-        'memory_power': r'Memory\s+Power:\s+(\d+\.?\d*)\s*(mW|W|µW)',
-        'other_power': r'Other\s+Power:\s+(\d+\.?\d*)\s*(mW|W|µW)',
-        'duration': r'Duration:\s+(\d+\.?\d*)\s*(s|ms|µs)',
-        'frequency': r'Frequency:\s+(\d+\.?\d*)\s*(MHz|GHz|KHz)',
-        'voltage': r'Voltage:\s+(\d+\.?\d*)\s*(V|mV)',
-        'temperature': r'Temperature:\s+(\d+\.?\d*)\s*(°C|C|°F|F)',
-        'metric_line': r'^(\w+[\w\s]*?):\s+(.+?)$',
+# ----------------------------
+# Helpers / Parsers
+# ----------------------------
+def find_voltus_reports(cwd, design):
+    """
+    Locate all Voltus reports for a given design.
+    Returns a dict: {scenario_name: [list of .report.avgpwr full paths]}
+    """
+    reports_dict = {}
+    voltus_dir = os.path.join(cwd, design, "voltus_work")
+    if not os.path.isdir(voltus_dir):
+        return reports_dict
+
+    for folder in sorted(os.listdir(voltus_dir)):
+        if folder.startswith("voltus_reports"):
+            folder_path = os.path.join(voltus_dir, folder)
+            if not os.path.isdir(folder_path):
+                continue
+            avgpwr_files = [
+                os.path.join(folder_path, f)
+                for f in os.listdir(folder_path)
+                if f.endswith(".report.avgpwr")  # tolerate extensions
+            ]
+            if avgpwr_files:
+                reports_dict[folder] = avgpwr_files
+
+    return reports_dict
+
+def _to_float(s):
+    if s is None:
+        return float("nan")
+    s = str(s).strip()
+    if s == "":
+        return float("nan")
+    s = s.replace(",", "")
+    s = s.replace("%", "")
+    try:
+        return float(s)
+    except Exception:
+        m = re.search(r"-?\d+(\.\d+)?", s)
+        if m:
+            try:
+                return float(m.group(0))
+            except:
+                pass
+    return float("nan")
+
+def parse_avgpwr_file(file_path):
+    """
+    Parse a .report.avgpwr file into:
+      - total_summary: dict {Internal, Switching, Leakage, Total}
+      - group_df: DataFrame(columns=[Group, Internal, Switching, Leakage, Total, Percentage])
+      - clock_df: DataFrame(columns=[Clock, Internal, Switching, Leakage, Total, Percentage])
+      - rail_df: DataFrame(columns=[Rail, Voltage, Internal, Switching, Leakage, Total, Percentage])
+    The parser is tolerant of spacing/format variations by using regex and multi-space splitting.
+    """
+    try:
+        with open(file_path, "r", encoding="utf-8", errors="ignore") as fh:
+            lines = [ln.rstrip() for ln in fh]
+    except Exception:
+        lines = []
+
+    # State machine for sections
+    section = None
+    total_summary = {}
+    group_rows = []
+    clock_rows = []
+    rail_rows = []
+
+    # Regex patterns for total summary lines
+    patterns_total = {
+        "Internal": re.compile(r"Total\s+Internal\s+Power\s*[:\-]?\s*([0-9,\.Ee+-]+)"),
+        "Switching": re.compile(r"Total\s+Switching\s+Power\s*[:\-]?\s*([0-9,\.Ee+-]+)"),
+        "Leakage": re.compile(r"Total\s+Leakage\s+Power\s*[:\-]?\s*([0-9,\.Ee+-]+)"),
+        "Total": re.compile(r"^Total\s+Power\s*[:\-]?\s*([0-9,\.Ee+-]+)")
     }
-    
-    def __init__(self):
-        """Initialize the parser"""
-        self.compiled_patterns = {
-            key: re.compile(pattern, re.IGNORECASE | re.MULTILINE)
-            for key, pattern in self.PATTERNS.items()
-        }
-    
-    def is_valid_report_file(self, filepath: str) -> bool:
-        """Check if the file is a valid .report.avgpwr file"""
-        return filepath.endswith('.report.avgpwr')
-    
-    def parse_file(self, filepath: str) -> Optional[Dict]:
-        """
-        Parse a .report.avgpwr file and extract power metrics
-        
-        Args:
-            filepath: Path to the .report.avgpwr file
-            
-        Returns:
-            Dictionary containing parsed metrics or None if parsing fails
-        """
-        if not self.is_valid_report_file(filepath):
-            return None
-        
-        try:
-            with open(filepath, 'r', encoding='utf-8') as f:
-                content = f.read()
-        except (IOError, OSError) as e:
-            print(f"Error reading file {filepath}: {e}")
-            return None
-        
-        return self._parse_content(content, filepath)
-    
-    def _parse_content(self, content: str, filename: str = '') -> Dict:
-        """
-        Parse the content of a power report file
-        
-        Args:
-            content: File content as string
-            filename: Original filename for reference
-            
-        Returns:
-            Dictionary with parsed metrics
-        """
-        parsed_data = {
-            'filename': filename,
-            'parsed_timestamp': datetime.utcnow().isoformat(),
-            'metrics': {},
-            'raw_metrics': {}
-        }
-        
-        # Parse timestamp
-        timestamp_match = self.compiled_patterns['timestamp'].search(content)
-        if timestamp_match:
-            parsed_data['metrics']['timestamp'] = timestamp_match.group(1)
-        
-        # Parse device name
-        device_match = self.compiled_patterns['device_name'].search(content)
-        if device_match:
-            parsed_data['metrics']['device_name'] = device_match.group(1)
-        
-        # Parse power values
-        power_fields = ['total_power', 'cpu_power', 'gpu_power', 'memory_power', 'other_power']
-        for field in power_fields:
-            match = self.compiled_patterns[field].search(content)
-            if match:
-                value = float(match.group(1))
-                unit = match.group(2)
-                normalized_value = self._normalize_power(value, unit)
-                field_name = field.replace('_power', '')
-                parsed_data['metrics'][f'{field_name}_power_mw'] = normalized_value
-                parsed_data['raw_metrics'][field_name] = {'value': value, 'unit': unit}
-        
-        # Parse frequency
-        freq_match = self.compiled_patterns['frequency'].search(content)
-        if freq_match:
-            value = float(freq_match.group(1))
-            unit = freq_match.group(2)
-            normalized_freq = self._normalize_frequency(value, unit)
-            parsed_data['metrics']['frequency_mhz'] = normalized_freq
-            parsed_data['raw_metrics']['frequency'] = {'value': value, 'unit': unit}
-        
-        # Parse voltage
-        voltage_match = self.compiled_patterns['voltage'].search(content)
-        if voltage_match:
-            value = float(voltage_match.group(1))
-            unit = voltage_match.group(2)
-            normalized_voltage = self._normalize_voltage(value, unit)
-            parsed_data['metrics']['voltage_v'] = normalized_voltage
-            parsed_data['raw_metrics']['voltage'] = {'value': value, 'unit': unit}
-        
-        # Parse temperature
-        temp_match = self.compiled_patterns['temperature'].search(content)
-        if temp_match:
-            value = float(temp_match.group(1))
-            unit = temp_match.group(2)
-            parsed_data['metrics']['temperature_c'] = value
-            parsed_data['raw_metrics']['temperature'] = {'value': value, 'unit': unit}
-        
-        # Parse duration
-        duration_match = self.compiled_patterns['duration'].search(content)
-        if duration_match:
-            value = float(duration_match.group(1))
-            unit = duration_match.group(2)
-            normalized_duration = self._normalize_duration(value, unit)
-            parsed_data['metrics']['duration_ms'] = normalized_duration
-            parsed_data['raw_metrics']['duration'] = {'value': value, 'unit': unit}
-        
-        # Parse any additional metric lines
-        for line in content.split('\n'):
-            metric_match = self.compiled_patterns['metric_line'].match(line.strip())
-            if metric_match and not line.strip().startswith('#'):
-                key = metric_match.group(1).lower().replace(' ', '_')
-                value = metric_match.group(2).strip()
-                if key not in parsed_data['metrics']:
-                    parsed_data['metrics'][key] = value
-        
-        return parsed_data
-    
-    @staticmethod
-    def _normalize_power(value: float, unit: str) -> float:
-        """Normalize power values to milliwatts"""
-        unit = unit.lower()
-        if unit == 'w':
-            return value * 1000
-        elif unit == 'µw':
-            return value / 1000
-        return value  # Already in mW
-    
-    @staticmethod
-    def _normalize_frequency(value: float, unit: str) -> float:
-        """Normalize frequency values to MHz"""
-        unit = unit.lower()
-        if unit == 'ghz':
-            return value * 1000
-        elif unit == 'khz':
-            return value / 1000
-        return value  # Already in MHz
-    
-    @staticmethod
-    def _normalize_voltage(value: float, unit: str) -> float:
-        """Normalize voltage values to volts"""
-        unit = unit.lower()
-        if unit == 'mv':
-            return value / 1000
-        return value  # Already in V
-    
-    @staticmethod
-    def _normalize_duration(value: float, unit: str) -> float:
-        """Normalize duration values to milliseconds"""
-        unit = unit.lower()
-        if unit == 's':
-            return value * 1000
-        elif unit == 'µs':
-            return value / 1000
-        return value  # Already in ms
 
+    # Table row splitter: split on 2 or more spaces to keep names with single spaces
+    def split_row(s):
+        parts = re.split(r"\s{2,}", s.strip())
+        parts = [p.strip() for p in parts if p.strip() != ""]
+        return parts
 
-class HTMLDashboardGenerator:
-    """Generate formatted HTML power dashboards from parsed data"""
-    
-    CSS_TEMPLATE = """
-    <style>
-        * {{
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-        }}
-        
-        body {{
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            min-height: 100vh;
-            padding: 20px;
-        }}
-        
-        .dashboard {{
-            max-width: 1200px;
-            margin: 0 auto;
-            background: white;
-            border-radius: 12px;
-            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
-            overflow: hidden;
-        }}
-        
-        .dashboard-header {{
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            color: white;
-            padding: 30px;
-            text-align: center;
-        }}
-        
-        .dashboard-title {{
-            font-size: 28px;
-            font-weight: 600;
-            margin-bottom: 8px;
-        }}
-        
-        .dashboard-subtitle {{
-            font-size: 14px;
-            opacity: 0.9;
-            margin-bottom: 8px;
-        }}
-        
-        .dashboard-filename {{
-            font-size: 12px;
-            opacity: 0.8;
-            font-family: 'Monaco', monospace;
-        }}
-        
-        .metrics-container {{
-            padding: 30px;
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
-            gap: 20px;
-        }}
-        
-        .metric-card {{
-            background: linear-gradient(135deg, #f5f7fa 0%, #c3cfe2 100%);
-            border-radius: 8px;
-            padding: 20px;
-            box-shadow: 0 4px 15px rgba(0, 0, 0, 0.1);
-            transition: transform 0.3s ease, box-shadow 0.3s ease;
-        }}
-        
-        .metric-card:hover {{
-            transform: translateY(-5px);
-            box-shadow: 0 8px 25px rgba(0, 0, 0, 0.15);
-        }}
-        
-        .metric-label {{
-            font-size: 12px;
-            text-transform: uppercase;
-            letter-spacing: 1px;
-            color: #555;
-            margin-bottom: 10px;
-            font-weight: 600;
-        }}
-        
-        .metric-value {{
-            font-size: 28px;
-            font-weight: 700;
-            color: #333;
-            margin-bottom: 5px;
-        }}
-        
-        .metric-unit {{
-            font-size: 12px;
-            color: #888;
-            font-weight: 500;
-        }}
-        
-        .power-critical {{
-            background: linear-gradient(135deg, #ff6b6b 0%, #ff8e53 100%) !important;
-            color: white;
-        }}
-        
-        .power-critical .metric-label {{
-            color: rgba(255, 255, 255, 0.9);
-        }}
-        
-        .power-critical .metric-value {{
-            color: white;
-        }}
-        
-        .power-critical .metric-unit {{
-            color: rgba(255, 255, 255, 0.8);
-        }}
-        
-        .power-warning {{
-            background: linear-gradient(135deg, #ffd89b 0%, #19547b 100%) !important;
-        }}
-        
-        .power-normal {{
-            background: linear-gradient(135deg, #a8edea 0%, #fed6e3 100%) !important;
-        }}
-        
-        .breakdown-section {{
-            padding: 30px;
-            background: #f8f9fa;
-            border-top: 1px solid #e9ecef;
-        }}
-        
-        .breakdown-title {{
-            font-size: 18px;
-            font-weight: 600;
-            color: #333;
-            margin-bottom: 20px;
-        }}
-        
-        .power-breakdown {{
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
-            gap: 15px;
-        }}
-        
-        .breakdown-item {{
-            background: white;
-            padding: 15px;
-            border-radius: 6px;
-            border-left: 4px solid #667eea;
-            box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
-        }}
-        
-        .breakdown-item-label {{
-            font-size: 11px;
-            color: #888;
-            text-transform: uppercase;
-            margin-bottom: 5px;
-            font-weight: 600;
-        }}
-        
-        .breakdown-item-value {{
-            font-size: 20px;
-            font-weight: 700;
-            color: #333;
-        }}
-        
-        .progress-bar {{
-            width: 100%;
-            height: 6px;
-            background: #e9ecef;
-            border-radius: 3px;
-            margin-top: 8px;
-            overflow: hidden;
-        }}
-        
-        .progress-fill {{
-            height: 100%;
-            background: linear-gradient(90deg, #667eea 0%, #764ba2 100%);
-            border-radius: 3px;
-        }}
-        
-        .footer {{
-            padding: 20px 30px;
-            background: #f8f9fa;
-            border-top: 1px solid #e9ecef;
-            text-align: center;
-            font-size: 12px;
-            color: #888;
-        }}
-        
-        @media (max-width: 768px) {{
-            .metrics-container {{
-                grid-template-columns: 1fr;
-            }}
-            
-            .dashboard-title {{
-                font-size: 22px;
-            }}
-        }}
-    </style>
-    """
-    
-    def __init__(self):
-        """Initialize the dashboard generator"""
-        self.parser = PowerReportParser()
-    
-    def generate_html_dashboard(self, parsed_data: Dict) -> str:
-        """
-        Generate an HTML dashboard from parsed power report data
-        
-        Args:
-            parsed_data: Dictionary containing parsed metrics
-            
-        Returns:
-            HTML string for the dashboard
-        """
-        metrics = parsed_data.get('metrics', {})
-        filename = parsed_data.get('filename', 'Unknown')
-        
-        # Extract key metrics
-        total_power = metrics.get('total_power_mw', 0)
-        cpu_power = metrics.get('cpu_power_mw', 0)
-        gpu_power = metrics.get('gpu_power_mw', 0)
-        memory_power = metrics.get('memory_power_mw', 0)
-        frequency = metrics.get('frequency_mhz', 0)
-        voltage = metrics.get('voltage_v', 0)
-        temperature = metrics.get('temperature_c', 0)
-        timestamp = metrics.get('timestamp', 'N/A')
-        device_name = metrics.get('device_name', 'Unknown Device')
-        
-        # Determine power level indicator
-        power_class = self._get_power_class(total_power)
-        
-        # Build HTML
-        html_parts = [
-            '<!DOCTYPE html>',
-            '<html lang="en">',
-            '<head>',
-            '    <meta charset="UTF-8">',
-            '    <meta name="viewport" content="width=device-width, initial-scale=1.0">',
-            '    <title>Power Dashboard - {}</title>'.format(Path(filename).stem),
-            self.CSS_TEMPLATE,
-            '</head>',
-            '<body>',
-            '    <div class="dashboard">',
-            '        <div class="dashboard-header">',
-            '            <div class="dashboard-title">⚡ Power Performance Dashboard</div>',
-            '            <div class="dashboard-subtitle">Device: {}</div>'.format(device_name),
-            '            <div class="dashboard-subtitle">Report Time: {}</div>'.format(timestamp),
-            '            <div class="dashboard-filename">Source: {}</div>'.format(Path(filename).name),
-            '        </div>',
-        ]
-        
-        # Main metrics section
-        html_parts.extend([
-            '        <div class="metrics-container">',
-            self._build_metric_card('Total Power', total_power, 'mW', power_class),
-            self._build_metric_card('CPU Power', cpu_power, 'mW', 'metric-card'),
-            self._build_metric_card('GPU Power', gpu_power, 'mW', 'metric-card'),
-            self._build_metric_card('Memory Power', memory_power, 'mW', 'metric-card'),
-            self._build_metric_card('Frequency', frequency, 'MHz', 'metric-card'),
-            self._build_metric_card('Voltage', voltage, 'V', 'metric-card'),
-            self._build_metric_card('Temperature', temperature, '°C', 'metric-card'),
-            '        </div>',
-        ])
-        
-        # Power breakdown section
-        html_parts.extend([
-            '        <div class="breakdown-section">',
-            '            <div class="breakdown-title">Power Distribution Breakdown</div>',
-            '            <div class="power-breakdown">',
-            self._build_breakdown_item('CPU', cpu_power, total_power),
-            self._build_breakdown_item('GPU', gpu_power, total_power),
-            self._build_breakdown_item('Memory', memory_power, total_power),
-            '            </div>',
-            '        </div>',
-        ])
-        
-        # Footer
-        html_parts.extend([
-            '        <div class="footer">',
-            '            Generated on {} | Power Report Dashboard'.format(datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')),
-            '        </div>',
-            '    </div>',
-            '</body>',
-            '</html>',
-        ])
-        
-        return '\n'.join(html_parts)
-    
-    @staticmethod
-    def _get_power_class(power_mw: float) -> str:
-        """Determine CSS class based on power consumption level"""
-        if power_mw > 10000:  # > 10W
-            return 'metric-card power-critical'
-        elif power_mw > 5000:  # > 5W
-            return 'metric-card power-warning'
-        return 'metric-card power-normal'
-    
-    @staticmethod
-    def _build_metric_card(label: str, value: float, unit: str, css_class: str) -> str:
-        """Build an individual metric card"""
-        return (
-            f'            <div class="{css_class}">'
-            f'                <div class="metric-label">{label}</div>'
-            f'                <div class="metric-value">{value:.2f}</div>'
-            f'                <div class="metric-unit">{unit}</div>'
-            f'            </div>'
-        )
-    
-    @staticmethod
-    def _build_breakdown_item(label: str, value: float, total: float) -> str:
-        """Build a power breakdown item with progress bar"""
-        percentage = (value / total * 100) if total > 0 else 0
-        return (
-            f'                <div class="breakdown-item">'
-            f'                    <div class="breakdown-item-label">{label}</div>'
-            f'                    <div class="breakdown-item-value">{value:.2f} mW</div>'
-            f'                    <div class="progress-bar">'
-            f'                        <div class="progress-fill" style="width: {percentage:.1f}%"></div>'
-            f'                    </div>'
-            f'                </div>'
-        )
-    
-    def generate_dashboard_from_file(self, filepath: str) -> Optional[str]:
-        """
-        Generate HTML dashboard directly from a .report.avgpwr file
-        
-        Args:
-            filepath: Path to the .report.avgpwr file
-            
-        Returns:
-            HTML string or None if parsing fails
-        """
-        parsed_data = self.parser.parse_file(filepath)
-        if parsed_data is None:
-            return None
-        return self.generate_html_dashboard(parsed_data)
+    # Identify when group/clock/rail tables start by header lines
+    for ln in lines:
+        ln_stripped = ln.strip()
+        # detect section headers
+        if re.match(r"^Total Power\b", ln_stripped, re.I):
+            section = "total"
+            continue
+        if re.match(r"^Group\b", ln_stripped) and "Internal" in ln_stripped:
+            section = "group"
+            continue
+        if re.match(r"^Clock\b", ln_stripped) and "Internal" in ln_stripped:
+            section = "clock"
+            continue
+        if re.match(r"^Rail\b", ln_stripped):
+            section = "rail"
+            continue
+        # skip separator lines
+        if re.match(r"^[-*]{3,}$", ln_stripped) or re.match(r"^\*[-]{3,}", ln_stripped):
+            continue
 
-
-def process_power_reports(directory: str, output_directory: str = None) -> Dict[str, str]:
-    """
-    Process all .report.avgpwr files in a directory and generate HTML dashboards
-    
-    Args:
-        directory: Directory containing .report.avgpwr files
-        output_directory: Directory to save generated HTML files (defaults to directory)
-        
-    Returns:
-        Dictionary mapping input filenames to output HTML filenames
-    """
-    if output_directory is None:
-        output_directory = directory
-    
-    # Create output directory if it doesn't exist
-    Path(output_directory).mkdir(parents=True, exist_ok=True)
-    
-    generator = HTMLDashboardGenerator()
-    results = {}
-    
-    # Find all .report.avgpwr files
-    report_files = Path(directory).glob('*.report.avgpwr')
-    
-    for report_file in report_files:
-        print(f"Processing: {report_file.name}")
-        
-        html_content = generator.generate_dashboard_from_file(str(report_file))
-        
-        if html_content:
-            # Generate output filename
-            output_filename = report_file.stem + '.html'
-            output_path = Path(output_directory) / output_filename
-            
-            # Write HTML file
-            with open(output_path, 'w', encoding='utf-8') as f:
-                f.write(html_content)
-            
-            results[report_file.name] = output_filename
-            print(f"  ✓ Generated: {output_filename}")
-        else:
-            print(f"  ✗ Failed to parse: {report_file.name}")
-    
-    return results
-
-
-# CLI Usage
-if __name__ == '__main__':
-    import sys
-    
-    if len(sys.argv) > 1:
-        input_path = sys.argv[1]
-        output_path = sys.argv[2] if len(sys.argv) > 2 else None
-        
-        if os.path.isdir(input_path):
-            print(f"Processing directory: {input_path}")
-            results = process_power_reports(input_path, output_path)
-            print(f"\nSuccessfully processed {len(results)} files")
-        elif os.path.isfile(input_path):
-            print(f"Processing file: {input_path}")
-            generator = HTMLDashboardGenerator()
-            html = generator.generate_dashboard_from_file(input_path)
-            
-            if html:
-                output_file = Path(input_path).stem + '.html'
-                if output_path:
-                    output_file = Path(output_path) / output_file
-                
-                with open(output_file, 'w') as f:
-                    f.write(html)
-                print(f"Dashboard saved to: {output_file}")
+        # parse based on section
+        if section == "total":
+            # try all total patterns on this line
+            for key, pat in patterns_total.items():
+                m = pat.search(ln)
+                if m:
+                    total_summary[key] = _to_float(m.group(1))
+                    break
+            # also handle lines like "Total Internal Power:   62.015345      59.71%"
+            # fallback: look for known labels in line
+            if "Total Internal Power" in ln and "Internal" not in total_summary:
+                m = re.search(r"Total\s+Internal\s+Power.*?([0-9,\.Ee+-]+)", ln)
+                if m:
+                    total_summary["Internal"] = _to_float(m.group(1))
+            if "Total Switching Power" in ln and "Switching" not in total_summary:
+                m = re.search(r"Total\s+Switching\s+Power.*?([0-9,\.Ee+-]+)", ln)
+                if m:
+                    total_summary["Switching"] = _to_float(m.group(1))
+            if "Total Leakage Power" in ln and "Leakage" not in total_summary:
+                m = re.search(r"Total\s+Leakage\s+Power.*?([0-9,\.Ee+-]+)", ln)
+                if m:
+                    total_summary["Leakage"] = _to_float(m.group(1))
+            if ln.strip().startswith("Total Power") and "Total" not in total_summary:
+                m = re.search(r"Total\s+Power.*?([0-9,\.Ee+-]+)", ln)
+                if m:
+                    total_summary["Total"] = _to_float(m.group(1))
+        elif section == "group":
+            # ignore header line variants
+            if re.search(r"^Group\s+.*Internal", ln, re.I):
+                continue
+            parts = split_row(ln)
+            if not parts:
+                continue
+            # Expect: [Group Name, Internal, Switching, Leakage, Total, Percentage]
+            # But group name may include spaces -> split_row already handles that.
+            if len(parts) >= 6:
+                name = parts[0]
+                internal = _to_float(parts[1])
+                switching = _to_float(parts[2])
+                leakage = _to_float(parts[3])
+                total = _to_float(parts[4])
+                pct = _to_float(parts[5])
+                group_rows.append([name, internal, switching, leakage, total, pct])
             else:
-                print("Failed to generate dashboard")
+                # try to pull numbers from the end of the line
+                nums = re.findall(r"([0-9,\.Ee+-]+)", ln)
+                if len(nums) >= 4:
+                    pct = _to_float(nums[-1])
+                    total = _to_float(nums[-2])
+                    leakage = _to_float(nums[-3])
+                    switching = _to_float(nums[-4])
+                    # name is the remaining prefix
+                    name = ln[:ln.rfind(nums[-4])].strip()
+                    group_rows.append([name, _to_float(switching if False else nums[-4]), switching, leakage, total, pct])
+        elif section == "clock":
+            if re.search(r"^Clock\s+.*Internal", ln, re.I):
+                continue
+            parts = split_row(ln)
+            if not parts:
+                continue
+            # Expect: [Clock Name, Internal, Switching, Leakage, Total, Percentage]
+            if len(parts) >= 6:
+                name = parts[0]
+                internal = _to_float(parts[1])
+                switching = _to_float(parts[2])
+                leakage = _to_float(parts[3])
+                total = _to_float(parts[4])
+                pct = _to_float(parts[5])
+                clock_rows.append([name, internal, switching, leakage, total, pct])
+            else:
+                nums = re.findall(r"([0-9,\.Ee+-]+)", ln)
+                if len(nums) >= 4:
+                    pct = _to_float(nums[-1])
+                    total = _to_float(nums[-2])
+                    leakage = _to_float(nums[-3])
+                    switching = _to_float(nums[-4])
+                    name = ln[:ln.rfind(nums[-4])].strip()
+                    clock_rows.append([name, _to_float(nums[-4]), switching, leakage, total, pct])
+        elif section == "rail":
+            if re.search(r"^Rail\s+.*Voltage", ln, re.I):
+                continue
+            parts = split_row(ln)
+            if not parts:
+                continue
+            # Expect: [Rail Name, Voltage, Internal, Switching, Leakage, Total, Percentage]
+            if len(parts) >= 7:
+                name = parts[0]
+                voltage = parts[1]
+                internal = _to_float(parts[2])
+                switching = _to_float(parts[3])
+                leakage = _to_float(parts[4])
+                total = _to_float(parts[5])
+                pct = _to_float(parts[6])
+                rail_rows.append([name, voltage, internal, switching, leakage, total, pct])
+            else:
+                # fallback: extract numbers; assume first token is name, second is voltage if present
+                nums = re.findall(r"([0-9,\.Ee+-]+)", ln)
+                if len(nums) >= 4:
+                    # attempt to find voltage (a short token like 0.8) near name
+                    tokens = ln.split()
+                    if len(tokens) >= 2 and re.match(r"^[0-9\.]+$", tokens[1]):
+                        name = tokens[0]
+                        voltage = tokens[1]
+                        internal = _to_float(nums[0])
+                        switching = _to_float(nums[1])
+                        leakage = _to_float(nums[2])
+                        total = _to_float(nums[3])
+                        pct = _to_float(nums[4]) if len(nums) > 4 else float("nan")
+                        rail_rows.append([name, voltage, internal, switching, leakage, total, pct])
+
+    # Build DataFrames
+    group_df = pd.DataFrame(group_rows, columns=["Group", "Internal", "Switching", "Leakage", "Total", "Percentage"]) if group_rows else pd.DataFrame(columns=["Group","Internal","Switching","Leakage","Total","Percentage"])
+    clock_df = pd.DataFrame(clock_rows, columns=["Clock", "Internal", "Switching", "Leakage", "Total", "Percentage"]) if clock_rows else pd.DataFrame(columns=["Clock","Internal","Switching","Leakage","Total","Percentage"])
+    rail_df = pd.DataFrame(rail_rows, columns=["Rail", "Voltage", "Internal", "Switching", "Leakage", "Total", "Percentage"]) if rail_rows else pd.DataFrame(columns=["Rail","Voltage","Internal","Switching","Leakage","Total","Percentage"])
+
+    # Ensure numeric types
+    for df, cols in [(group_df, ["Internal","Switching","Leakage","Total","Percentage"]),
+                     (clock_df, ["Internal","Switching","Leakage","Total","Percentage"]),
+                     (rail_df, ["Internal","Switching","Leakage","Total","Percentage"])]:
+        for c in cols:
+            if c in df.columns:
+                df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    # Fill total_summary from parsed objects if some keys missing
+    def safe_sum(series):
+        try:
+            return float(pd.to_numeric(series, errors="coerce").sum())
+        except:
+            return float("nan")
+
+    if not group_df.empty:
+        # many reports provide group totals; use those if present
+        if "Internal" not in total_summary or pd.isna(total_summary.get("Internal")):
+            total_summary["Internal"] = safe_sum(group_df["Internal"])
+        if "Switching" not in total_summary or pd.isna(total_summary.get("Switching")):
+            total_summary["Switching"] = safe_sum(group_df["Switching"])
+        if "Leakage" not in total_summary or pd.isna(total_summary.get("Leakage")):
+            total_summary["Leakage"] = safe_sum(group_df["Leakage"])
+        if "Total" not in total_summary or pd.isna(total_summary.get("Total")):
+            total_summary["Total"] = safe_sum(group_df["Total"])
+
+    # final numeric coercion for summary
+    for k in ["Internal","Switching","Leakage","Total"]:
+        if k not in total_summary:
+            total_summary[k] = float("nan")
         else:
-            print(f"Path not found: {input_path}")
+            total_summary[k] = _to_float(total_summary[k])
+
+    return {
+        "Total Summary": total_summary,
+        "Group Power": group_df,
+        "Clock Power": clock_df,
+        "Rail Power": rail_df
+    }
+
+# ----------------------------
+# HTML writer (formatted text output)
+# ----------------------------
+def _fmt(v, precision=6, trim=False):
+    try:
+        if pd.isna(v):
+            return ""
+    except:
+        pass
+    try:
+        v_f = float(v)
+    except:
+        return str(v)
+    if precision == 0:
+        s = f"{v_f:,.0f}"
     else:
-        print("Usage: python backend.py <input_file_or_directory> [output_directory]")
-        print("Example: python backend.py report.report.avgpwr .")
-        print("Example: python backend.py ./reports ./dashboards")
+        s = f"{v_f:,.{precision}f}"
+    if trim:
+        # remove trailing zeros and dot
+        s = s.rstrip("0").rstrip(".")
+    return s
+
+def write_html(obj, name, outdir, report_date=""):
+    """
+    Write a text-formatted HTML page matching the requested layout.
+    obj: dict of parsed sections returned from parse_avgpwr_file
+    """
+    os.makedirs(outdir, exist_ok=True)
+    html_path = os.path.join(outdir, f"{name}.html")
+
+    total = obj.get("Total Summary", {})
+    t_internal = total.get("Internal", float("nan"))
+    t_switch = total.get("Switching", float("nan"))
+    t_leak = total.get("Leakage", float("nan"))
+    t_total = total.get("Total", float("nan"))
+
+    def pct_str(v):
+        try:
+            if pd.isna(v) or pd.isna(t_total) or t_total == 0:
+                return ""
+            return f"{(float(v) / float(t_total) * 100):.2f}%"
+        except:
+            return ""
+
+    lines = []
+    lines.append("Total Power")
+    lines.append("-" * 58)
+    lines.append(f"Total Internal Power:         {_fmt(t_internal,6):>12}       {pct_str(t_internal)}")
+    lines.append(f"Total Switching Power:        {_fmt(t_switch,6):>12}       {pct_str(t_switch)}")
+    lines.append(f"Total Leakage Power:          {_fmt(t_leak,6):>12}       {pct_str(t_leak)}")
+    lines.append("-" * 58)
+    lines.append(f"Total Power:                  {_fmt(t_total,6):>12}      100.00%")
+    lines.append("-" * 58)
+    lines.append("")
+
+    # Group table
+    group_df = obj.get("Group Power", pd.DataFrame())
+    lines.append("Group                           Internal   Switching     Leakage     Total    Percentage")
+    lines.append("-" * 89)
+    if not group_df.empty:
+        for _, r in group_df.iterrows():
+            name_col = str(r.get("Group", "")).ljust(30)[:30]
+            internal = _fmt(r.get("Internal", 0), 2, trim=True)
+            switching = _fmt(r.get("Switching", 4), 4, trim=True)
+            leakage = _fmt(r.get("Leakage", 4), 4, trim=True)
+            total_g = _fmt(r.get("Total", 0), 2, trim=True)
+            pct = _fmt(r.get("Percentage", (r.get("Total", 0)/t_total*100) if t_total not in (None,0) and not pd.isna(t_total) else 0), 2, trim=True)
+            lines.append(f"{name_col} {internal:>8}   {switching:>8}     {leakage:>8}     {total_g:>8}    {pct:>8}")
+    else:
+        lines.append("(No Group Power data found)")
+    # Group totals row
+    if not group_df.empty:
+        tot_internal = group_df["Internal"].sum(skipna=True)
+        tot_switch = group_df["Switching"].sum(skipna=True)
+        tot_leak = group_df["Leakage"].sum(skipna=True)
+        tot_total = group_df["Total"].sum(skipna=True)
+    else:
+        tot_internal = t_internal
+        tot_switch = t_switch
+        tot_leak = t_leak
+        tot_total = t_total
+    lines.append("-" * 89)
+    lines.append(f"{'Total':30} { _fmt(tot_internal,2):>8}    { _fmt(tot_switch,2):>8}        { _fmt(tot_leak,3):>8}       { _fmt(tot_total,1):>8}    {(_fmt(100,0))}")
+    lines.append("-" * 89)
+    lines.append("")
+
+    # Clock table
+    clock_df = obj.get("Clock Power", pd.DataFrame())
+    lines.append("Clock")
+    lines.append("-" * 89)
+    if not clock_df.empty:
+        for _, r in clock_df.iterrows():
+            name_col = str(r.get("Clock", "")).ljust(30)[:30]
+            internal = _fmt(r.get("Internal", 0), 2)
+            switching = _fmt(r.get("Switching", 2), 2)
+            leakage = _fmt(r.get("Leakage", 3), 3)
+            total_c = _fmt(r.get("Total", 0), 2)
+            pct = _fmt(r.get("Percentage", 0), 2)
+            lines.append(f"{name_col} {internal:>8}       {switching:>8}       {leakage:>8}       {total_c:>8}     {pct:>6}")
+    else:
+        lines.append("(No Clock Power data found)")
+    lines.append("-" * 89)
+    # Clock totals (excluding duplicates) - sum of clock_df or fallback to totals
+    if not clock_df.empty:
+        c_tot_internal = clock_df["Internal"].sum(skipna=True)
+        c_tot_switch = clock_df["Switching"].sum(skipna=True)
+        c_tot_leak = clock_df["Leakage"].sum(skipna=True)
+        c_tot_total = clock_df["Total"].sum(skipna=True)
+    else:
+        c_tot_internal = t_internal
+        c_tot_switch = t_switch
+        c_tot_leak = t_leak
+        c_tot_total = t_total
+    lines.append(f"{'Total (excluding duplicates)':30} {_fmt(c_tot_internal,2):>8}      {_fmt(c_tot_switch,2):>8}       {_fmt(c_tot_leak,3):>8}       {_fmt(c_tot_total,1):>8}     100")
+    lines.append("-" * 89)
+    lines.append("")
+
+    # Rail table
+    rail_df = obj.get("Rail Power", pd.DataFrame())
+    lines.append("Rail")
+    lines.append("-" * 89)
+    if not rail_df.empty:
+        for _, r in rail_df.iterrows():
+            name_col = str(r.get("Rail", "")).ljust(30)[:30]
+            voltage = str(r.get("Voltage", "")).ljust(6)[:6]
+            internal = _fmt(r.get("Internal", 0), 2)
+            switching = _fmt(r.get("Switching", 2), 2)
+            leakage = _fmt(r.get("Leakage", 3), 3)
+            total_r = _fmt(r.get("Total", 0), 1)
+            pct = _fmt(r.get("Percentage", 0), 2)
+            lines.append(f"{name_col} {voltage:>6}  {internal:>8}    {switching:>8}    {leakage:>8}    {total_r:>8}    {pct:>6}")
+    else:
+        lines.append("(No Rail Power data found)")
+    lines.append("-" * 89)
+    # final totals row (repeat totals)
+    lines.append(f"{'':30} {_fmt(t_internal,2):>8}    {_fmt(t_switch,2):>8}      {_fmt(t_leak,3):>8}     {_fmt(t_total,1):>8}     100")
+    lines.append("-" * 89)
+
+    pre_text = "\n".join(lines)
+    with open(html_path, "w", encoding="utf-8") as fh:
+        fh.write("<html><head><meta charset='utf-8'><title>Power Dashboard - ")
+        fh.write(str(name))
+        fh.write("</title><style>body{font-family: monospace; white-space: pre; padding:20px; background:#fff;}</style></head><body>\n")
+        fh.write(f"<div style='margin-bottom:8px;'><a href='/' style='text-decoration:none;padding:6px 12px;background:#2c7be5;color:white;border-radius:4px;'>⬅ Back</a></div>\n")
+        if report_date:
+            fh.write(f"<div style='margin-bottom:6px;font-family:monospace;'>Date: {report_date}</div>\n")
+        fh.write("<pre>\n")
+        fh.write(pre_text)
+        fh.write("\n</pre>\n</body></html>")
+
+    return html_path
+
+# ----------------------------
+# DataFrame generation
+# ----------------------------
+def generate_power_df(design, reports_dict):
+    """
+    Convert all avgpwr reports into dict of parsed report data:
+    {scenario_name: {file_name: parsed_obj}}
+    """
+    output = {}
+    for scenario, files in reports_dict.items():
+        scenario_tables = {}
+        for fpath in files:
+            parsed = parse_avgpwr_file(fpath)
+            scenario_tables[os.path.basename(fpath)] = parsed
+        output[scenario] = scenario_tables
+    return output
+
+# ----------------------------
+# Main entry
+# ----------------------------
+def run_power(cwd, outdir, designs):
+    """
+    Generate formatted HTML dashboards for a list of designs.
+    Returns a list of generated HTML file basenames (without .html).
+    """
+    os.makedirs(outdir, exist_ok=True)
+    generated = []
+
+    for design in designs:
+        reports_dict = find_voltus_reports(cwd, design)
+        if not reports_dict:
+            continue
+
+        dfs_dict = generate_power_df(design, reports_dict)
+        for scenario, tables_dict in dfs_dict.items():
+            base = f"{design}_{scenario}"
+            for file_name, parsed_obj in tables_dict.items():
+                safe_file = re.sub(r"[^\w\-_\.]", "_", file_name)
+                page_name = f"{base}_{safe_file}"
+                write_html(parsed_obj, page_name, outdir, report_date=time.ctime())
+                generated.append(page_name)
+
+    return list(dict.fromkeys(generated))
