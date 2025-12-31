@@ -1,0 +1,240 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Timing Dashboard Automation</title>
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            margin: 40px;
+            background-color: #f8f9fa;
+        }
+
+        .container {
+            background: white;
+            padding: 30px;
+            border-radius: 8px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+            max-width: 800px;
+            margin: auto;
+        }
+
+        /* Loading Overlay Styling */
+        #loader-overlay {
+            display: none;
+            position: fixed;
+            top: 0; left: 0;
+            width: 100%; height: 100%;
+            background: rgba(255, 255, 255, 0.9);
+            z-index: 9999;
+            text-align: center;
+            padding-top: 15%;
+        }
+
+        .spinner {
+            border: 8px solid #f3f3f3;
+            border-top: 8px solid #2c7be5;
+            border-radius: 50%;
+            width: 60px; height: 60px;
+            animation: spin 1s linear infinite;
+            display: inline-block;
+        }
+
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+
+        .loading-text {
+            margin-top: 20px;
+            font-size: 1.2em;
+            color: #2c7be5;
+            font-weight: bold;
+        }
+
+        /* Form & Search Styling */
+        #designSearch {
+            width: 100%;
+            padding: 10px;
+            margin-bottom: 10px;
+            border: 1px solid #2c7be5;
+            border-radius: 4px;
+            box-sizing: border-box;
+            font-size: 1em;
+        }
+
+        /* NAVIGATION STYLE: File Explorer look for the select box */
+        select {
+            width: 100%;
+            padding: 0;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            font-family: 'Courier New', Courier, monospace;
+            background-color: #fff;
+        }
+
+        select option {
+            padding: 8px 12px;
+            border-bottom: 1px solid #f0f0f0;
+            cursor: pointer;
+        }
+
+        select option:hover {
+            background-color: #e7f3ff;
+        }
+
+        button {
+            padding: 12px 30px;
+            background: #2c7be5;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 1.1em;
+            font-weight: bold;
+        }
+
+        button:hover { background: #1a5db5; }
+
+        .search-container { margin-bottom: 15px; }
+
+        .links-row {
+            margin-bottom: 5px;
+            display: flex;
+            gap: 15px;
+        }
+
+        .links-row a {
+            font-size: 0.85em;
+            color: #2c7be5;
+            text-decoration: none;
+        }
+
+        .links-row a:hover { text-decoration: underline; }
+
+        .result-box {
+            background: #e7f3ff;
+            border: 1px solid #b6d4fe;
+            padding: 20px;
+            border-radius: 8px;
+            margin-top: 20px;
+        }
+    </style>
+</head>
+<body>
+
+<div id="loader-overlay">
+    <div class="spinner"></div>
+    <div class="loading-text">
+        Parsing Reports & Generating Dashboards...<br>
+        Please do not refresh.
+    </div>
+</div>
+
+<div class="container">
+    <h2>Timing Dashboard Automation</h2>
+    <p style="color: #666;">Browse the design folders, then select one or more implementation runs to compare.<br>
+  Use the Ctrl key to select additional designs.</p>
+
+    <form method="post" id="dashboardForm" onsubmit="showLoader()">
+        
+        <label><b>Search & Navigate Designs:</b></label>
+        <div class="search-container">
+            <input 
+                type="text" 
+                id="designSearch" 
+                onkeyup="filterDesigns()" 
+                placeholder="🔍 Search folders (e.g. 'eco_v1' or 'block_name')..."
+                autocomplete="off"
+            >
+        </div>
+
+        <div class="links-row">
+            <a href="#" onclick="selectAll(true); return false;">[+] Select All Visible</a> 
+            <a href="#" onclick="selectAll(false); return false;">[-] Deselect All</a>
+        </div>
+
+        <select name="designs" id="designSelect" multiple size="15" required>
+            {% for path in designs %}
+                <option value="{{ path }}">
+                    📂 {{ path }}
+                </option>
+            {% endfor %}
+        </select>
+
+        <br><br>
+
+        <label><b>Die Name:</b></label><br>
+        <input 
+            name="die" 
+            value="ESF" 
+            required 
+            style="padding: 10px; width: 120px; border: 1px solid #ddd; border-radius: 4px;"
+        >
+
+        <br><br>
+
+        <button type="submit">Run Dashboard</button>
+    </form>
+
+    {% if done %}
+        <div class="result-box">
+            <h3 style="margin: 0 0 10px 0;">✅ Generation Complete</h3>
+            <p>Redirecting you to the report...</p>
+            
+            {% if comparison %}
+                <a href="/files/comparison_dashboard.html" style="font-weight:bold;">📊 Open Comparison Dashboard</a>
+                <hr style="border:0; border-top:1px solid #b6d4fe; margin: 10px 0;">
+            {% endif %}
+
+            {% for design in generated %}
+                <a href="/files/{{ design }}.html">📂 Open Dashboard: {{ design }}</a>
+            {% endfor %}
+        </div>
+    {% endif %}
+</div>
+
+<script>
+    // 1. Show Spinner
+    function showLoader() {
+        document.getElementById('loader-overlay').style.display = 'block';
+    }
+
+    // 2. Real-time Search Filtering
+    function filterDesigns() {
+        const filter = document.getElementById("designSearch").value.toLowerCase();
+        const select = document.getElementById("designSelect");
+        const options = select.options;
+
+        for (let i = 0; i < options.length; i++) {
+            const text = options[i].text.toLowerCase();
+            options[i].style.display = text.includes(filter) ? "" : "none";
+        }
+    }
+
+    // 3. Selection Logic (Only visible)
+    function selectAll(bool) {
+        const select = document.getElementById('designSelect');
+        for (let i = 0; i < select.options.length; i++) {
+            if (select.options[i].style.display !== "none") {
+                select.options[i].selected = bool;
+            }
+        }
+    }
+
+    // 4. Automatic Redirect
+    {% if done %}
+        (function() {
+            var comparisonExists = "{{ comparison }}".toLowerCase() === "true";
+            var generatedList = {{ generated | tojson }};
+
+            if (comparisonExists) {
+                window.location.href = "/files/comparison_dashboard.html";
+            } else if (generatedList.length > 0) {
+                window.location.href = "/files/" + generatedList[0] + ".html";
+            }
+        })();
+    {% endif %}
+</script>
+
+</body>
+</html>
